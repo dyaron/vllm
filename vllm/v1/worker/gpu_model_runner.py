@@ -651,6 +651,8 @@ class GPUModelRunner(
             pin_memory=self.pin_memory,
         )
 
+        # print(f"DAVID GPUModelRunner pinned_memory {self.pin_memory}", flush=True)
+
         # Pre-allocated tensor for copying valid sampled token counts to CPU,
         # with dedicated stream for overlapping and event for coordination.
         self.valid_sampled_token_count_event: torch.Event | None = None
@@ -3373,176 +3375,178 @@ class GPUModelRunner(
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-        kv_connector_output = self.kv_connector_output
-        self.kv_connector_output = None
 
-        if self.execute_model_state is None:
-            # Nothing to do (PP non-final rank case), output isn't used.
-            if not kv_connector_output:
-                return None  # type: ignore[return-value]
+        with record_function_or_nullcontext("sample_tokens"):
+            kv_connector_output = self.kv_connector_output
+            self.kv_connector_output = None
 
-            # In case of PP with kv transfer, we need to pass through the
-            # kv_connector_output
-            if kv_connector_output.is_empty():
-                return EMPTY_MODEL_RUNNER_OUTPUT
+            if self.execute_model_state is None:
+                # Nothing to do (PP non-final rank case), output isn't used.
+                if not kv_connector_output:
+                    return None  # type: ignore[return-value]
 
-            output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
-            output.kv_connector_output = kv_connector_output
-            return output
+                # In case of PP with kv transfer, we need to pass through the
+                # kv_connector_output
+                if kv_connector_output.is_empty():
+                    return EMPTY_MODEL_RUNNER_OUTPUT
 
-        # Unpack ephemeral state.
-        (
-            scheduler_output,
-            logits,
-            spec_decode_metadata,
-            spec_decode_common_attn_metadata,
-            hidden_states,
-            sample_hidden_states,
-            aux_hidden_states,
-            ec_connector_output,
-            cudagraph_stats,
-        ) = self.execute_model_state
-        # Clear ephemeral state.
-        self.execute_model_state = None
+                output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+                output.kv_connector_output = kv_connector_output
+                return output
 
-        # Apply structured output bitmasks if present.
-        if grammar_output is not None:
-            apply_grammar_bitmask(
-                scheduler_output, grammar_output, self.input_batch, logits
-            )
-
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
-
-        self._draft_token_ids = None
-        self._draft_token_req_ids = None
-        self.input_batch.prev_sampled_token_ids = None
-
-        def propose_draft_token_ids(sampled_token_ids):
-            assert spec_decode_common_attn_metadata is not None
-            with record_function_or_nullcontext("gpu_model_runner: draft"):
-                self._draft_token_ids = self.propose_draft_token_ids(
-                    scheduler_output,
-                    sampled_token_ids,
-                    self.input_batch.sampling_metadata,
-                    hidden_states,
-                    sample_hidden_states,
-                    aux_hidden_states,
-                    spec_decode_metadata,
-                    spec_decode_common_attn_metadata,
-                )
-                self._copy_draft_token_ids_to_cpu(scheduler_output)
-
-        spec_config = self.speculative_config
-        propose_drafts_after_bookkeeping = False
-        if spec_config is not None:
-            input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
-                spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
-                <= self.effective_drafter_max_model_len
-            )
-            if spec_config.use_eagle() and not spec_config.disable_padded_drafter_batch:
-                # EAGLE speculative decoding can use the GPU sampled tokens
-                # as inputs, and does not need to wait for bookkeeping to finish.
-                assert isinstance(self.drafter, EagleProposer)
-                sampled_token_ids = sampler_output.sampled_token_ids
-                if input_fits_in_drafter:
-                    propose_draft_token_ids(sampled_token_ids)
-                elif self.valid_sampled_token_count_event is not None:
-                    assert spec_decode_common_attn_metadata is not None
-                    next_token_ids, valid_sampled_tokens_count = (
-                        self.drafter.prepare_next_token_ids_padded(
-                            spec_decode_common_attn_metadata,
-                            sampled_token_ids,
-                            self.requests,
-                            self.input_batch,
-                            self.discard_request_mask.gpu,
-                        )
-                    )
-                    self._copy_valid_sampled_token_count(
-                        next_token_ids, valid_sampled_tokens_count
-                    )
-                    # Since we couldn't run the drafter,
-                    # just use zeros for the draft tokens.
-                    self._draft_token_ids = torch.zeros(
-                        1, device=self.device, dtype=torch.int32
-                    ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
-                    self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
-            else:
-                propose_drafts_after_bookkeeping = input_fits_in_drafter
-
-        with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+            # Unpack ephemeral state.
             (
-                num_nans_in_logits,
-                logprobs_lists,
-                valid_sampled_token_ids,
-                prompt_logprobs_dict,
-                req_ids_output_copy,
-                req_id_to_index_output_copy,
-                invalid_req_indices,
-            ) = self._bookkeeping_sync(
                 scheduler_output,
-                sampler_output,
                 logits,
-                hidden_states,
-                scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
-            )
+                spec_decode_common_attn_metadata,
+                hidden_states,
+                sample_hidden_states,
+                aux_hidden_states,
+                ec_connector_output,
+                cudagraph_stats,
+            ) = self.execute_model_state
+            # Clear ephemeral state.
+            self.execute_model_state = None
 
-        if propose_drafts_after_bookkeeping:
-            # ngram and other speculative decoding methods use the sampled
-            # tokens on the CPU, so they are run after bookkeeping.
-            propose_draft_token_ids(valid_sampled_token_ids)
+            # Apply structured output bitmasks if present.
+            if grammar_output is not None:
+                apply_grammar_bitmask(
+                    scheduler_output, grammar_output, self.input_batch, logits
+                )
 
-        with record_function_or_nullcontext("gpu_model_runner: eplb"):
-            self.eplb_step()
+            with record_function_or_nullcontext("gpu_model_runner: sample"):
+                sampler_output = self._sample(logits, spec_decode_metadata)
 
-        with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
-            if self.model_config.enable_return_routed_experts:
-                capturer = RoutedExpertsCapturer.get_instance()
-                if capturer is not None:
-                    capturer.save_captured_experts(indices=self.slot_mapping)  # noqa
+            self._draft_token_ids = None
+            self._draft_token_req_ids = None
+            self.input_batch.prev_sampled_token_ids = None
+
+            def propose_draft_token_ids(sampled_token_ids):
+                assert spec_decode_common_attn_metadata is not None
+                with record_function_or_nullcontext("gpu_model_runner: draft"):
+                    self._draft_token_ids = self.propose_draft_token_ids(
+                        scheduler_output,
+                        sampled_token_ids,
+                        self.input_batch.sampling_metadata,
+                        hidden_states,
+                        sample_hidden_states,
+                        aux_hidden_states,
+                        spec_decode_metadata,
+                        spec_decode_common_attn_metadata,
+                    )
+                    self._copy_draft_token_ids_to_cpu(scheduler_output)
+
+            spec_config = self.speculative_config
+            propose_drafts_after_bookkeeping = False
+            if spec_config is not None:
+                input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
+                    spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
+                    <= self.effective_drafter_max_model_len
+                )
+                if spec_config.use_eagle() and not spec_config.disable_padded_drafter_batch:
+                    # EAGLE speculative decoding can use the GPU sampled tokens
+                    # as inputs, and does not need to wait for bookkeeping to finish.
+                    assert isinstance(self.drafter, EagleProposer)
+                    sampled_token_ids = sampler_output.sampled_token_ids
+                    if input_fits_in_drafter:
+                        propose_draft_token_ids(sampled_token_ids)
+                    elif self.valid_sampled_token_count_event is not None:
+                        assert spec_decode_common_attn_metadata is not None
+                        next_token_ids, valid_sampled_tokens_count = (
+                            self.drafter.prepare_next_token_ids_padded(
+                                spec_decode_common_attn_metadata,
+                                sampled_token_ids,
+                                self.requests,
+                                self.input_batch,
+                                self.discard_request_mask.gpu,
+                            )
+                        )
+                        self._copy_valid_sampled_token_count(
+                            next_token_ids, valid_sampled_tokens_count
+                        )
+                        # Since we couldn't run the drafter,
+                        # just use zeros for the draft tokens.
+                        self._draft_token_ids = torch.zeros(
+                            1, device=self.device, dtype=torch.int32
+                        ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+                        self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
                 else:
-                    logger.error("RoutedExpertsCapturer not initialized.")
+                    propose_drafts_after_bookkeeping = input_fits_in_drafter
 
-            output = ModelRunnerOutput(
-                req_ids=req_ids_output_copy,
-                req_id_to_index=req_id_to_index_output_copy,
-                sampled_token_ids=valid_sampled_token_ids,
-                logprobs=logprobs_lists,
-                prompt_logprobs_dict=prompt_logprobs_dict,
-                kv_connector_output=kv_connector_output,
-                ec_connector_output=ec_connector_output
-                if self.supports_mm_inputs
-                else None,
-                num_nans_in_logits=num_nans_in_logits,
-                cudagraph_stats=cudagraph_stats,
-            )
+            with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+                (
+                    num_nans_in_logits,
+                    logprobs_lists,
+                    valid_sampled_token_ids,
+                    prompt_logprobs_dict,
+                    req_ids_output_copy,
+                    req_id_to_index_output_copy,
+                    invalid_req_indices,
+                ) = self._bookkeeping_sync(
+                    scheduler_output,
+                    sampler_output,
+                    logits,
+                    hidden_states,
+                    scheduler_output.total_num_scheduled_tokens,
+                    spec_decode_metadata,
+                )
 
-        if not self.use_async_scheduling:
-            return output
+            if propose_drafts_after_bookkeeping:
+                # ngram and other speculative decoding methods use the sampled
+                # tokens on the CPU, so they are run after bookkeeping.
+                propose_draft_token_ids(valid_sampled_token_ids)
 
-        with record_function_or_nullcontext(
-            "gpu_model_runner: AsyncGPUModelRunnerOutput"
-        ):
-            async_output = AsyncGPUModelRunnerOutput(
-                model_runner_output=output,
-                sampled_token_ids=sampler_output.sampled_token_ids,
-                logprobs_tensors=sampler_output.logprobs_tensors,
-                invalid_req_indices=invalid_req_indices,
-                async_output_copy_stream=self.async_output_copy_stream,
-                vocab_size=self.input_batch.vocab_size,
-            )
-        with record_function_or_nullcontext(
-            "gpu_model_runner: set_async_sampled_token_ids"
-        ):
-            # Save ref of sampled_token_ids CPU tensor if the batch contains
-            # any requests with sampling params that require output ids.
-            self.input_batch.set_async_sampled_token_ids(
-                async_output.sampled_token_ids_cpu,
-                async_output.async_copy_ready_event,
-            )
+            with record_function_or_nullcontext("gpu_model_runner: eplb"):
+                self.eplb_step()
 
-        return async_output
+            with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
+                if self.model_config.enable_return_routed_experts:
+                    capturer = RoutedExpertsCapturer.get_instance()
+                    if capturer is not None:
+                        capturer.save_captured_experts(indices=self.slot_mapping)  # noqa
+                    else:
+                        logger.error("RoutedExpertsCapturer not initialized.")
+
+                output = ModelRunnerOutput(
+                    req_ids=req_ids_output_copy,
+                    req_id_to_index=req_id_to_index_output_copy,
+                    sampled_token_ids=valid_sampled_token_ids,
+                    logprobs=logprobs_lists,
+                    prompt_logprobs_dict=prompt_logprobs_dict,
+                    kv_connector_output=kv_connector_output,
+                    ec_connector_output=ec_connector_output
+                    if self.supports_mm_inputs
+                    else None,
+                    num_nans_in_logits=num_nans_in_logits,
+                    cudagraph_stats=cudagraph_stats,
+                )
+
+            if not self.use_async_scheduling:
+                return output
+
+            with record_function_or_nullcontext(
+                "gpu_model_runner: AsyncGPUModelRunnerOutput"
+            ):
+                async_output = AsyncGPUModelRunnerOutput(
+                    model_runner_output=output,
+                    sampled_token_ids=sampler_output.sampled_token_ids,
+                    logprobs_tensors=sampler_output.logprobs_tensors,
+                    invalid_req_indices=invalid_req_indices,
+                    async_output_copy_stream=self.async_output_copy_stream,
+                    vocab_size=self.input_batch.vocab_size,
+                )
+            with record_function_or_nullcontext(
+                "gpu_model_runner: set_async_sampled_token_ids"
+            ):
+                # Save ref of sampled_token_ids CPU tensor if the batch contains
+                # any requests with sampling params that require output ids.
+                self.input_batch.set_async_sampled_token_ids(
+                    async_output.sampled_token_ids_cpu,
+                    async_output.async_copy_ready_event,
+                )
+
+            return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
