@@ -439,8 +439,6 @@ class EngineCore:
             deferred_scheduler_output = None
             if self.scheduler.has_requests():
                 with record_function_or_nullcontext("schedule"):
-                    print(f"DAVID schedule python_tid: {threading.get_ident()} linux_tid: {threading.get_native_id()}", flush=True)
-                    logger.info(f"DAVID schedule python_tid: {threading.get_ident()} linux_tid: {threading.get_native_id()}")
                     scheduler_output = self.scheduler.schedule()
                 with record_function_or_nullcontext("execute_model"):
                     exec_future = self.model_executor.execute_model(

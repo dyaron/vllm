@@ -260,12 +260,6 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
-
-        # print thred ids
-        import threading
-        print(f"DAVID Scheduler python_tid: {threading.get_ident()} linux_tid: {threading.get_native_id()}", flush=True)
-        logger.info(f"DAVID Scheduler python_tid: {threading.get_ident()} linux_tid: {threading.get_native_id()}")
-
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []

@@ -651,8 +651,6 @@ class GPUModelRunner(
             pin_memory=self.pin_memory,
         )
 
-        # print(f"DAVID GPUModelRunner pinned_memory {self.pin_memory}", flush=True)
-
         # Pre-allocated tensor for copying valid sampled token counts to CPU,
         # with dedicated stream for overlapping and event for coordination.
         self.valid_sampled_token_count_event: torch.Event | None = None
