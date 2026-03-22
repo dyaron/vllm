@@ -504,21 +504,21 @@ class AsyncLLM(EngineClient):
                 while True:
                     # 1) Pull EngineCoreOutputs from the EngineCore.
 
-                    timestamp = time.time()
-                    print(f"DAVID calling await engine_core.get_output_async() {timestamp:.6f}")
+                    # timestamp = time.time()
+                    # print(f"DAVID calling await engine_core.get_output_async() {timestamp:.6f}")
 
                     outputs = await engine_core.get_output_async()
                     num_outputs = len(outputs.outputs)
 
-                    timestamp = time.time()
-                    print(f"DAVID output_handler {timestamp:.6f} num_outputs: {num_outputs}")
+                    # timestamp = time.time()
+                    # print(f"DAVID output_handler {timestamp:.6f} num_outputs: {num_outputs}")
 
                     iteration_stats = (
                         IterationStats() if (log_stats and num_outputs) else None
                     )
 
-                    timestamp = time.time()
-                    print(f"DAVID after iteration_stats {timestamp:.6f} num_outputs: {num_outputs}")
+                    # timestamp = time.time()
+                    # print(f"DAVID after iteration_stats {timestamp:.6f} num_outputs: {num_outputs}")
 
                     # Split outputs into chunks of at most
                     # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
@@ -532,8 +532,8 @@ class AsyncLLM(EngineClient):
                             outputs_slice, outputs.timestamp, iteration_stats
                         )
 
-                        timestamp = time.time()
-                        print(f"DAVID after process_outputs {timestamp:.6f} num_outputs: {num_outputs}")
+                        # timestamp = time.time()
+                        # print(f"DAVID after process_outputs {timestamp:.6f} num_outputs: {num_outputs}")
 
                         # NOTE: RequestOutputs are pushed to their queues.
                         assert not processed_outputs.request_outputs
@@ -542,25 +542,25 @@ class AsyncLLM(EngineClient):
                         if end < num_outputs:
                             await asyncio.sleep(0)
 
-                        timestamp = time.time()
-                        print(f"DAVID after sleep {timestamp:.6f} num_outputs: {num_outputs}")
+                        # timestamp = time.time()
+                        # print(f"DAVID after sleep {timestamp:.6f} num_outputs: {num_outputs}")
 
                         # 3) Abort any reqs that finished due to stop strings.
                         if processed_outputs.reqs_to_abort:
                             await engine_core.abort_requests_async(
                                 processed_outputs.reqs_to_abort
                             )
-                            timestamp = time.time()
-                            print(f"DAVID after abort_requests_async {timestamp:.6f} num_outputs: {num_outputs}")
+                            # timestamp = time.time()
+                            # print(f"DAVID after abort_requests_async {timestamp:.6f} num_outputs: {num_outputs}")
 
 
-                    timestamp = time.time()
-                    print(f"DAVID done split outputs into chunks {timestamp:.6f} num_outputs: {num_outputs}")
+                    # timestamp = time.time()
+                    # print(f"DAVID done split outputs into chunks {timestamp:.6f} num_outputs: {num_outputs}")
 
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)
 
-                    timestamp = time.time()
-                    print(f"DAVID done update_scheduler_stats {timestamp:.6f} num_outputs: {num_outputs}")
+                    # timestamp = time.time()
+                    # print(f"DAVID done update_scheduler_stats {timestamp:.6f} num_outputs: {num_outputs}")
 
 
                     # 4) Logging.
@@ -574,8 +574,8 @@ class AsyncLLM(EngineClient):
                             mm_cache_stats=input_processor.stat_mm_cache(),
                         )
 
-                    timestamp = time.time()
-                    print(f"DAVID done logger_manager {timestamp:.6f} num_outputs: {num_outputs}")
+                    # timestamp = time.time()
+                    # print(f"DAVID done logger_manager {timestamp:.6f} num_outputs: {num_outputs}")
 
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")

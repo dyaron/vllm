@@ -31,6 +31,7 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerStats,
 )
+from vllm.v1.utils import record_function_or_nullcontext
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
@@ -514,91 +515,92 @@ class OutputProcessor:
         within the loop below.
         """
 
-        request_outputs: list[RequestOutput | PoolingRequestOutput] = []
-        reqs_to_abort: list[str] = []
-        for engine_core_output in engine_core_outputs:
-            req_id = engine_core_output.request_id
-            req_state = self.request_states.get(req_id)
-            if req_state is None:
-                # Ignore output for already-aborted request.
-                continue
+        with record_function_or_nullcontext("process_output"):
+            request_outputs: list[RequestOutput | PoolingRequestOutput] = []
+            reqs_to_abort: list[str] = []
+            for engine_core_output in engine_core_outputs:
+                req_id = engine_core_output.request_id
+                req_state = self.request_states.get(req_id)
+                if req_state is None:
+                    # Ignore output for already-aborted request.
+                    continue
 
-            # 1) Compute stats for this iteration.
-            self._update_stats_from_output(
-                req_state, engine_core_output, engine_core_timestamp, iteration_stats
+                # 1) Compute stats for this iteration.
+                self._update_stats_from_output(
+                    req_state, engine_core_output, engine_core_timestamp, iteration_stats
+                )
+
+                new_token_ids = engine_core_output.new_token_ids
+                pooling_output = engine_core_output.pooling_output
+                finish_reason = engine_core_output.finish_reason
+                stop_reason = engine_core_output.stop_reason
+                kv_transfer_params = engine_core_output.kv_transfer_params
+                routed_experts = engine_core_output.routed_experts
+                req_state.num_cached_tokens = engine_core_output.num_cached_tokens
+                req_state.is_prefilling = False
+
+                if pooling_output is None:
+                    assert req_state.detokenizer is not None
+                    assert req_state.logprobs_processor is not None
+                    # 2) Detokenize the token ids into text and perform stop checks.
+                    stop_string = req_state.detokenizer.update(
+                        new_token_ids, finish_reason == FinishReason.STOP
+                    )
+                    if stop_string:
+                        finish_reason = FinishReason.STOP
+                        stop_reason = stop_string
+
+                    # 3) Compute sample and prompt logprobs for request,
+                    # if required.
+                    req_state.logprobs_processor.update_from_output(engine_core_output)
+
+                # 4) Create and handle RequestOutput objects.
+                if request_output := req_state.make_request_output(
+                    new_token_ids,
+                    pooling_output,
+                    finish_reason,
+                    stop_reason,
+                    kv_transfer_params,
+                    routed_experts,
+                ):
+                    if req_state.queue is not None:
+                        # AsyncLLM: put into queue for handling by generate().
+                        req_state.queue.put(request_output)
+                    else:
+                        # LLMEngine: return list of RequestOutputs.
+                        request_outputs.append(request_output)
+
+                # Free completed requests.
+                if finish_reason is not None:
+                    self.request_states.pop(req_id)
+
+                    internal_ids = self.external_req_ids[req_state.external_req_id]
+                    internal_ids.remove(req_id)
+                    if not internal_ids:
+                        del self.external_req_ids[req_state.external_req_id]
+
+                    # Remove parent request if applicable.
+                    parent_req = req_state.parent_req
+                    if parent_req and not parent_req.child_requests:
+                        self.parent_requests.pop(parent_req.request_id, None)
+                    if not self.request_states:
+                        self._requests_drained.set()
+                    if not engine_core_output.finished:
+                        # If req not finished in EngineCore, but Detokenizer
+                        # detected stop string, abort needed in EngineCore.
+                        reqs_to_abort.append(req_id)
+
+                    # Track per-request stats
+                    self._update_stats_from_finished(
+                        req_state, finish_reason, iteration_stats
+                    )
+                    if self.tracer:
+                        self.do_tracing(engine_core_output, req_state, iteration_stats)
+
+            return OutputProcessorOutput(
+                request_outputs=request_outputs,
+                reqs_to_abort=reqs_to_abort,
             )
-
-            new_token_ids = engine_core_output.new_token_ids
-            pooling_output = engine_core_output.pooling_output
-            finish_reason = engine_core_output.finish_reason
-            stop_reason = engine_core_output.stop_reason
-            kv_transfer_params = engine_core_output.kv_transfer_params
-            routed_experts = engine_core_output.routed_experts
-            req_state.num_cached_tokens = engine_core_output.num_cached_tokens
-            req_state.is_prefilling = False
-
-            if pooling_output is None:
-                assert req_state.detokenizer is not None
-                assert req_state.logprobs_processor is not None
-                # 2) Detokenize the token ids into text and perform stop checks.
-                stop_string = req_state.detokenizer.update(
-                    new_token_ids, finish_reason == FinishReason.STOP
-                )
-                if stop_string:
-                    finish_reason = FinishReason.STOP
-                    stop_reason = stop_string
-
-                # 3) Compute sample and prompt logprobs for request,
-                # if required.
-                req_state.logprobs_processor.update_from_output(engine_core_output)
-
-            # 4) Create and handle RequestOutput objects.
-            if request_output := req_state.make_request_output(
-                new_token_ids,
-                pooling_output,
-                finish_reason,
-                stop_reason,
-                kv_transfer_params,
-                routed_experts,
-            ):
-                if req_state.queue is not None:
-                    # AsyncLLM: put into queue for handling by generate().
-                    req_state.queue.put(request_output)
-                else:
-                    # LLMEngine: return list of RequestOutputs.
-                    request_outputs.append(request_output)
-
-            # Free completed requests.
-            if finish_reason is not None:
-                self.request_states.pop(req_id)
-
-                internal_ids = self.external_req_ids[req_state.external_req_id]
-                internal_ids.remove(req_id)
-                if not internal_ids:
-                    del self.external_req_ids[req_state.external_req_id]
-
-                # Remove parent request if applicable.
-                parent_req = req_state.parent_req
-                if parent_req and not parent_req.child_requests:
-                    self.parent_requests.pop(parent_req.request_id, None)
-                if not self.request_states:
-                    self._requests_drained.set()
-                if not engine_core_output.finished:
-                    # If req not finished in EngineCore, but Detokenizer
-                    # detected stop string, abort needed in EngineCore.
-                    reqs_to_abort.append(req_id)
-
-                # Track per-request stats
-                self._update_stats_from_finished(
-                    req_state, finish_reason, iteration_stats
-                )
-                if self.tracer:
-                    self.do_tracing(engine_core_output, req_state, iteration_stats)
-
-        return OutputProcessorOutput(
-            request_outputs=request_outputs,
-            reqs_to_abort=reqs_to_abort,
-        )
 
     def update_scheduler_stats(self, scheduler_stats: SchedulerStats | None):
         self.lora_states.update_scheduler_stats(scheduler_stats)
